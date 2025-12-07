@@ -1,0 +1,10 @@
+*.pdf
+*.rar
+*.zip
+*.png
+*.jpeg
+*.jpg
+venv/
+__pycache__/
+*.pyc   
+.docx

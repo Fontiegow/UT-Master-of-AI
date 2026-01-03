@@ -150,7 +150,7 @@ def custom_grid_search_cv(X, y, k_values, n_folds=5):
         scores[k] = np.mean(fold_accuracies)
 
     return scores
-
+```
 Notes
 
 No feature scaling is applied in this implementation

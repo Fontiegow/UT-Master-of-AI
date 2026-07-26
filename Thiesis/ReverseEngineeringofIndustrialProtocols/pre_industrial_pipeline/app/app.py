@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import os
 import sys
-import plotly.express as px
 import plotly.graph_objects as go
 import string
 
@@ -20,7 +19,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom Styling for Metric Cards & Layout
+# Custom Styling
 st.markdown("""
 <style>
     .metric-card {
@@ -29,21 +28,23 @@ st.markdown("""
         padding: 15px;
         border-left: 5px solid #4F8BF9;
     }
-    .status-box {
-        background-color: #111827;
-        padding: 12px;
-        border-radius: 6px;
-        border: 1px solid #374151;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("⚡ Network Protocol Segmentation Engine")
-st.markdown("Unsupervised structural boundary detection using information-theoretic & correlation metrics.")
+st.markdown("Unsupervised structural boundary detection integrating **N-Gram Tokenization** and **Mutual Information**.")
 
 # --- SIDEBAR ---
 st.sidebar.header("Protocol Configuration")
 protocol_choice = st.sidebar.selectbox("Select Target Protocol", ("ARP", "Modbus TCP", "DNP3"))
+
+st.sidebar.divider()
+st.sidebar.header("AI Upgrade Parameters")
+ngram_size = st.sidebar.slider(
+    "N-Gram Tokenization Size (Bytes)", 
+    min_value=1, max_value=8, value=2, step=1,
+    help="Forces structural boundaries in static, zero-variance spans. (e.g., 2 forces 16-bit word alignment)."
+)
 
 @st.cache_data
 def load_protocol_data(protocol_name):
@@ -54,35 +55,21 @@ def load_protocol_data(protocol_name):
     
     if os.path.exists(csv_path):
         try:
-            # Read CSV and respect the header row
             raw_df = pd.read_csv(csv_path, dtype=str)
-            
-            # Ensure the 'hex' column exists
-            if 'hex' not in raw_df.columns:
-                st.error("Missing 'hex' column in dataset.")
-                return pd.DataFrame()
+            if 'hex' not in raw_df.columns: return pd.DataFrame()
 
             hex_digits = set(string.hexdigits)
             byte_matrix = []
             
-            # Only process the specific 'hex' column
             for hex_string in raw_df['hex'].dropna():
                 clean_str = str(hex_string).strip().replace("0x", "").replace(" ", "")
-                
                 if len(clean_str) > 0 and set(clean_str).issubset(hex_digits):
-                    # Convert pairs of hex characters into integer bytes
                     bytes_row = [int(clean_str[i:i+2], 16) for i in range(0, len(clean_str), 2) if len(clean_str[i:i+2]) == 2]
-                    
-                    if len(bytes_row) > 0:
-                        byte_matrix.append(bytes_row)
+                    if len(bytes_row) > 0: byte_matrix.append(bytes_row)
             
             df = pd.DataFrame(byte_matrix)
-            
-            if df.empty: 
-                return pd.DataFrame()
+            if df.empty: return pd.DataFrame()
                 
-            # Truncate trailing Ethernet padding (zeros) to isolate the ARP layer.
-            # Standard ARP is 28 bytes (offsets 0 to 27). 
             max_protocol_len = 28
             if len(df.columns) > max_protocol_len:
                 df = df.iloc[:, :max_protocol_len]
@@ -111,20 +98,17 @@ df_ground_truth = load_ground_truth(protocol_choice)
 
 if not df_packets.empty:
     st.sidebar.success(f"Loaded {len(df_packets)} packets ({len(df_packets.columns)} bytes/packet)")
-else:
-    st.sidebar.error("Failed to load dataset.")
 
 # --- ROADMAP PROCESS PIPELINE ---
 st.markdown("### 🗺️ Algorithmic Pipeline Flow")
 col_a, col_b, col_c, col_d = st.columns(4)
 col_a.info("**1. Byte Matrix Generation**\n\nConverts hex streams into 2D byte integer arrays.")
 col_b.info("**2. Information Metrics**\n\nCalculates FVI & Shannon Entropy per byte offset.")
-col_c.info("**3. BCS & Mutual Info Filtering**\n\nDetects candidate boundaries & prunes correlated byte splits.")
-col_d.info("**4. Macro Consolidation**\n\nMerges similar regions into final schema layout.")
+col_c.info("**3. BCS & Mutual Info**\n\nDetects candidates & prevents multi-byte field fragmentation.")
+col_d.info("**4. N-Gram Tokenization**\n\nFractures massive invariant static blocks into logical words.")
 
 st.divider()
 
-# --- VISUALIZATION HELPER FUNCTIONS ---
 def render_3bar_visual_comparison(schema_baseline, schema_mi, ground_truth_df, total_bytes):
     st.subheader("⚔️ 3-Tier Schema Comparison: Evolutionary Journey")
     
@@ -139,146 +123,102 @@ def render_3bar_visual_comparison(schema_baseline, schema_mi, ground_truth_df, t
             color = colors[idx % len(colors)]
             
             fig.add_trace(go.Bar(
-                name=row['Field ID'],
-                x=[length],
-                y=[y_label],
-                orientation='h',
+                name=row['Field ID'], x=[length], y=[y_label], orientation='h',
                 marker=dict(color=color, line=dict(color='#111827', width=1.5)),
                 hovertemplate=f"<b>{row['Field ID']}</b><br>Offsets: [{start}:{end}]<br>Length: {length}B<br>Typology: {row['Semantic Typology']}<extra></extra>",
                 showlegend=False
             ))
 
-    # Bar 3: MI-Enhanced Engine (AI Upgrade)
-    add_schema_bar(schema_mi, '3. MI-Enhanced AI')
-
-    # Bar 2: Baseline Literature Engine (Entropy + KL)
+    add_schema_bar(schema_mi, '3. MI & N-Gram Enhanced AI')
     add_schema_bar(schema_baseline, '2. Baseline Literature')
 
-    # Bar 1: Ground Truth (RFC Standard)
     if not ground_truth_df.empty:
         rfc_colors = ["#6366F1", "#EC4899", "#14B8A6", "#8B5CF6", "#F97316", "#06B6D4", "#A855F7", "#EAB308"]
         for idx, row in ground_truth_df.iterrows():
-            start = int(row['Start Offset'])
-            end = int(row['End Offset'])
+            start, end = int(row['Start Offset']), int(row['End Offset'])
             length = end - start + 1
-            color = rfc_colors[idx % len(rfc_colors)]
             
             fig.add_trace(go.Bar(
-                name=row['Actual Field'],
-                x=[length],
-                y=['1. Ground Truth (RFC)'],
-                orientation='h',
-                marker=dict(color=color, line=dict(color='#111827', width=1.5)),
+                name=row['Actual Field'], x=[length], y=['1. Ground Truth (RFC)'], orientation='h',
+                marker=dict(color=rfc_colors[idx % len(rfc_colors)], line=dict(color='#111827', width=1.5)),
                 hovertemplate=f"<b>{row['Actual Field']}</b><br>Offsets: [{start}:{end}]<br>Length: {length}B<extra></extra>",
                 showlegend=False
             ))
 
     fig.update_layout(
-        barmode='stack',
-        template='plotly_dark',
-        height=300,
-        xaxis_title="Byte Offset",
-        xaxis=dict(range=[0, total_bytes], tick0=0, dtick=2),
-        yaxis=dict(categoryorder='array', categoryarray=["1. Ground Truth (RFC)", "2. Baseline Literature", "3. MI-Enhanced AI"]),
+        barmode='stack', template='plotly_dark', height=300,
+        xaxis_title="Byte Offset", xaxis=dict(range=[0, total_bytes], tick0=0, dtick=2),
+        yaxis=dict(categoryorder='array', categoryarray=["1. Ground Truth (RFC)", "2. Baseline Literature", "3. MI & N-Gram Enhanced AI"]),
         margin=dict(l=20, r=20, t=20, b=20)
     )
-    
     st.plotly_chart(fig, use_container_width=True)
 
 # --- EXECUTION SECTION ---
 if st.sidebar.button("🚀 Run Segmentation Pipeline", type="primary"):
-    with st.spinner("Processing protocol trace matrix with Mutual Information..."):
+    with st.spinner("Processing protocol trace matrix with advanced heuristics..."):
         
-        engine = ProtocolSegmentationEngine(df_packets)
+        # Initialize engine with the selected N-Gram size
+        engine = ProtocolSegmentationEngine(df_packets, ngram_size=ngram_size)
         fvi_df = engine.calculate_fvi_and_typology()
         
-        # Execute pipeline and retrieve both baseline and MI-enhanced results
         schema_baseline, schema_mi, candidates, kl_verified, final_bounds = engine.run_pipeline()
 
         # --- TOP KPI METRICS ---
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
         kpi1.metric("Total Bytes Analyzed", f"{len(df_packets.columns)} Bytes")
-        kpi2.metric("Discovered Fields (MI)", f"{len(schema_mi)} Fields")
-        kpi3.metric("Raw Candidate Bounds", f"{len(candidates)}")
-        kpi4.metric("MI-Pruned Boundaries", f"{len(final_bounds)}")
+        kpi2.metric("Discovered Fields (AI)", f"{len(schema_mi)} Fields")
+        kpi3.metric("Static N-Gram Size", f"{ngram_size}-Byte Word")
+        kpi4.metric("Final Refined Boundaries", f"{len(final_bounds)}")
 
         st.divider()
 
-        # --- VISUALIZATION 1: FVI Entropy Profile Line Chart ---
+        # --- VISUALIZATION 1: FVI Entropy Profile ---
         st.subheader("📈 Field Variability Index (FVI) & Discovered Boundaries")
-        
         fig = go.Figure()
         
-        # Plot FVI Curve
         fig.add_trace(go.Scatter(
-            x=fvi_df['offset'], 
-            y=fvi_df['fvi'], 
-            mode='lines+markers', 
-            name='FVI Variability',
-            line=dict(color='#3B82F6', width=2),
-            marker=dict(size=4)
+            x=fvi_df['offset'], y=fvi_df['fvi'], mode='lines+markers', 
+            name='FVI Variability', line=dict(color='#3B82F6', width=2), marker=dict(size=4)
         ))
         
-        # Overlay Discovered Boundary Vertical Lines
         for b in final_bounds:
             fig.add_vline(x=b - 0.5, line_width=2, line_dash="dash", line_color="#EF4444")
 
         fig.update_layout(
-            xaxis_title="Byte Offset",
-            yaxis_title="Variability Index (0 = Invariant, 1 = Max Entropy)",
-            template="plotly_dark",
-            height=320,
-            margin=dict(l=20, r=20, t=30, b=20)
+            xaxis_title="Byte Offset", yaxis_title="Variability Index (0 = Invariant, 1 = Max Entropy)",
+            template="plotly_dark", height=320, margin=dict(l=20, r=20, t=30, b=20)
         )
         st.plotly_chart(fig, use_container_width=True)
 
         st.divider()
 
-        # --- VISUALIZATION 2: 3-Bar Comparative Schema Layout ---
+        # --- VISUALIZATION 2: 3-Bar Comparative Schema ---
         render_3bar_visual_comparison(schema_baseline, schema_mi, df_ground_truth, len(df_packets.columns))
 
         st.divider()
 
-        # --- DETAILED COMPARISON TABLES ---
         with st.expander("🎓 Architecture Briefing: Overcoming Segmentation Challenges", expanded=True):
-            st.markdown("""
-            ### 🔬 Evolutionary Journey of the Segmentation Engine
-            Transitioning from standard literature heuristics to an unsupervised machine learning architecture required identifying and solving distinct mathematical roadblocks.
-            """)
-            
             c1, c2, c3, c4 = st.columns(4)
             
             with c1:
                 st.error("**Obstacle 1: The Binary Masking Error**")
-                st.markdown("""
-                * **Symptom:** Evaluated $184$ bytes instead of standard $28$-byte ARP header.
-                * **Root Cause:** Raw CSV binary digits (`0000...`) parsed as hex characters.
-                * **Solution:** Isolated parsing strictly to `hex` series and truncated padding to 28 bytes.
-                """)
+                st.markdown("Resolved misaligned parsing where CSV binary streams were evaluated incorrectly. Applied strict `hex` series truncation to standardize header limits.")
                 
             with c2:
-                st.warning("**Obstacle 2: Zero-Entropy Under-Segmentation**")
+                st.success("**Obstacle 2: Zero-Entropy Under-Segmentation**")
                 st.markdown("""
-                * **Symptom:** Bytes `0` through `6` merged into a massive block (`Field_00`).
-                * **Root Cause:** Absolute header constants cause Shannon Entropy to collapse to $0.0$.
-                * **Solution:** Applied 16-bit word boundary heuristics on zero-variance spans.
+                * **Symptom:** Bytes `0` through `6` clumped into a massive block.
+                * **Root Cause:** Shannon Entropy collapses to $0.0$ on static constants, nullifying statistical detection.
+                * **Solution:** Introduced **N-Gram Tokenization** to scan flat FVI lines and forcefully fracture them along standard 16-bit network alignments.
                 """)
                 
             with c3:
                 st.warning("**Obstacle 3: Subnet Dynamic Fragmentation**")
-                st.markdown("""
-                * **Symptom:** Dynamic IP/MAC addresses broken across subnet prefixes.
-                * **Root Cause:** Static IP prefixes (e.g. `192.168.x.x`) cause artificial FVI drops.
-                * **Solution:** Implemented moving-average sliding window thresholding.
-                """)
+                st.markdown("Implemented moving-average sliding window thresholding to prevent address fragmenting caused by static subnet prefixes masking underlying structures.")
 
             with c4:
                 st.success("**Obstacle 4: Address Fragmentation (The AI Upgrade)**")
-                st.markdown("""
-                * **Symptom:** Multi-byte fields split into 2-byte or 3-byte fragments.
-                * **Root Cause:** KL Divergence treats adjacent bytes independently.
-                * **Solution:** Integrated **Mutual Information ($I(X;Y)$)** to measure joint correlation and bind dependent address bytes back together.
-                """)
+                st.markdown("Solved the issue of multi-byte fields splitting into fragments. Integrated **Mutual Information $I(X;Y)$** to measure joint correlation and bind adjacent address bytes.")
 
 else:
-    st.info("👈 Click **Run Segmentation Pipeline** in the sidebar to execute the analysis flow.")
+    st.info("👈 Configure your protocol settings and click **Run Segmentation Pipeline** to execute the analysis flow.")

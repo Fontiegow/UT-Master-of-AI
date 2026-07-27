@@ -46,6 +46,72 @@ ngram_size = st.sidebar.slider(
     help="Forces structural boundaries in static, zero-variance spans. (e.g., 2 forces 16-bit word alignment)."
 )
 
+import plotly.graph_objects as go
+import plotly.express as px
+
+def plot_3tier_comparison(bounds_baseline, bounds_mi, bounds_dbscan, total_bytes):
+    """
+    Renders a multi-bar horizontal stacked plot with distinct qualitative colors
+    per field unit (matching the Ground Truth visual style).
+    """
+    fig = go.Figure()
+
+    # Use Plotly's qualitative color palette cycle
+    palette = px.colors.qualitative.Plotly + px.colors.qualitative.Bold
+
+    tiers = [
+        ("1. Baseline Literature", bounds_baseline),
+        ("2. MI & N-Gram (Imp 1+2)", bounds_mi),
+        ("3. DBSCAN Clustering (Imp 3)", bounds_dbscan)
+    ]
+
+    for tier_name, bounds in tiers:
+        # Reconstruct continuous field segments
+        full_bounds = sorted(list(set([0] + list(bounds) + [total_bytes])))
+        
+        for i in range(len(full_bounds) - 1):
+            start = full_bounds[i]
+            end = full_bounds[i+1]
+            length = end - start
+            end_label = end - 1
+            
+            # Pick color cyclically based on field index
+            color = palette[i % len(palette)]
+            
+            fig.add_trace(go.Bar(
+                y=[tier_name],
+                x=[length],
+                name=f"Field {i:02d} [{start}:{end_label}]",
+                orientation='h',
+                marker=dict(
+                    color=color,
+                    line=dict(color='#111111', width=1.5) # Crisp dark borders between fields
+                ),
+                hovertemplate=(
+                    f"<b>Field {i:02d}</b><br>"
+                    f"<b>Range:</b> [{start} : {end_label}]<br>"
+                    f"<b>Length:</b> {length} Bytes<extra></extra>"
+                ),
+                showlegend=False
+            ))
+
+    fig.update_layout(
+        barmode='stack',
+        title="<b>3-Tier Visual Schema Comparison</b>",
+        xaxis=dict(
+            title="Byte Offset",
+            tickmode="linear",
+            dtick=2, # Ticks every 2 bytes for better readability
+            range=[0, total_bytes]
+        ),
+        yaxis=dict(autorange="reversed"), # Top-to-bottom layout
+        height=380,
+        margin=dict(l=20, r=20, t=50, b=40),
+        template="plotly_dark"
+    )
+    
+    return fig
+
 @st.cache_data
 def load_protocol_data(protocol_name):
     if protocol_name == "ARP":
@@ -161,13 +227,22 @@ if st.sidebar.button("🚀 Run Segmentation Pipeline", type="primary"):
         engine = ProtocolSegmentationEngine(df_packets, ngram_size=ngram_size)
         fvi_df = engine.calculate_fvi_and_typology()
         
-        schema_baseline, schema_mi, candidates, kl_verified, final_bounds = engine.run_pipeline()
+        # Unpack all 6 outputs returned by the 3-tier engine
+        (
+            schema_baseline, 
+            schema_mi, 
+            schema_dbscan, 
+            bounds_baseline, 
+            final_bounds,   # <--- Assign final_bounds here (MI + N-Gram result)
+            bounds_dbscan
+        ) = engine.run_pipeline()
 
         # --- TOP KPI METRICS ---
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-        kpi1.metric("Total Bytes Analyzed", f"{len(df_packets.columns)} Bytes")
-        kpi2.metric("Discovered Fields (AI)", f"{len(schema_mi)} Fields")
-        kpi3.metric("Static N-Gram Size", f"{ngram_size}-Byte Word")
+
+        kpi1.metric("Total Bytes / Packet", f"{engine.num_bytes} B")
+        kpi2.metric("Baseline Boundaries", f"{len(bounds_baseline)}")
+        kpi3.metric("DBSCAN Clusters", f"{len(bounds_dbscan)}")
         kpi4.metric("Final Refined Boundaries", f"{len(final_bounds)}")
 
         st.divider()
@@ -194,6 +269,7 @@ if st.sidebar.button("🚀 Run Segmentation Pipeline", type="primary"):
 
         # --- VISUALIZATION 2: 3-Bar Comparative Schema ---
         render_3bar_visual_comparison(schema_baseline, schema_mi, df_ground_truth, len(df_packets.columns))
+        st.plotly_chart(plot_3tier_comparison(bounds_baseline, final_bounds, bounds_dbscan, engine.num_bytes), use_container_width=True)
 
         st.divider()
 

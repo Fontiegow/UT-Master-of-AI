@@ -2,14 +2,18 @@ import numpy as np
 import pandas as pd
 from scipy.stats import entropy
 from sklearn.metrics import mutual_info_score
-from typing import List, Tuple
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import StandardScaler
+from typing import List, Tuple, Set
 
 class ProtocolSegmentationEngine:
     """
     Multi-Stage Information-Theoretic Protocol Segmentation Engine.
     
-    Now incorporates N-Gram Tokenization to handle static invariant headers 
-    alongside Mutual Information for dynamic address fields.
+    Includes:
+    - Baseline: FVI + BCS + KL Divergence + Consolidation
+    - Improvements 1 & 2: Mutual Information Pruning + N-Gram Tokenization (Masked)
+    - Improvement 3: Unsupervised Feature Clustering (DBSCAN)
     """
 
     def __init__(
@@ -22,18 +26,6 @@ class ProtocolSegmentationEngine:
         ngram_size: int = 2,
         static_threshold: float = 0.05
     ):
-        """
-        Initializes the Multi-Stage Protocol Segmentation Pipeline.
-        
-        Args:
-            dataframe (pd.DataFrame): Raw byte matrix (Packets x Byte Offsets).
-            bcs_threshold (float): Sensitivity cutoff for candidate boundary detection.
-            kl_threshold (float): Minimum relative entropy (bits) required to verify boundaries.
-            merge_threshold (float): Maximum FVI delta allowed when merging adjacent fields.
-            mi_threshold (float): Maximum Mutual Information threshold allowed across a boundary.
-            ngram_size (int): Standard protocol word size for static tokenization (default: 2 for 16-bit).
-            static_threshold (float): Maximum FVI for a block to be considered 'Static'.
-        """
         self.df = dataframe.copy()
         self.bcs_threshold = bcs_threshold
         self.kl_threshold = kl_threshold
@@ -54,9 +46,7 @@ class ProtocolSegmentationEngine:
         tau_static: float = 0.05, 
         tau_status: float = 0.40
     ) -> pd.DataFrame:
-        """
-        Calculates the Field Variability Index (FVI) per byte offset using normalized Shannon Entropy.
-        """
+        """Calculates the Field Variability Index (FVI) per byte offset."""
         fvi_data = []
         h_max = np.log2(256) 
 
@@ -88,9 +78,7 @@ class ProtocolSegmentationEngine:
         return pd.DataFrame(fvi_data, columns=["offset", "raw_entropy", "fvi", "typology"])
 
     def detect_boundaries_bcs(self, fvi_df: pd.DataFrame, alpha: float = 0.5) -> List[int]:
-        """
-        Fuses continuous FVI gradients with discrete typology transitions.
-        """
+        """Fuses continuous FVI gradients with discrete typology transitions."""
         fvi_vector = fvi_df['fvi'].values
         typology_labels = fvi_df['typology'].values
         num_bytes = len(fvi_vector)
@@ -138,16 +126,26 @@ class ProtocolSegmentationEngine:
         """Filters out statistical noise using Symmetric KL Divergence."""
         return [c for c in candidates if self._compute_symmetric_kl(c, window_size) >= self.kl_threshold]
 
-    def prune_boundaries_with_mi(self, candidates: List[int]) -> List[int]:
-        """Uses Mutual Information (MI) to prune false boundaries in multi-byte address structures."""
-        pruned_boundaries = []
+    def prune_boundaries_with_mi(self, candidates: List[int]) -> Tuple[List[int], Set[int]]:
+        """
+        Improvement 1 (FIXED): Mutual Information Pruning.
+        Returns kept boundaries AND a set of 'masked' boundaries that were pruned.
+        Masked boundaries protect highly correlated bytes (like MACs) from later N-Gram tokenization.
+        """
+        kept_boundaries = []
+        masked_boundaries = set()
+        
         for b in candidates:
             if b <= 0 or b >= self.num_bytes: continue
             col_left, col_right = self.matrix[:, b - 1], self.matrix[:, b]
             mi = mutual_info_score(col_left, col_right)
+            
             if mi < self.mi_threshold:
-                pruned_boundaries.append(b)
-        return pruned_boundaries
+                kept_boundaries.append(b)
+            else:
+                masked_boundaries.add(b) # High correlation detected; mask this split point
+                
+        return kept_boundaries, masked_boundaries
 
     def consolidate_macro_boundaries(self, verified_boundaries: List[int], fvi_df: pd.DataFrame) -> List[int]:
         """Iteratively merges adjacent field units based on distribution similarity."""
@@ -179,13 +177,11 @@ class ProtocolSegmentationEngine:
             
         return [b for b in current_bounds if b not in [0, max_len]]
 
-    def tokenize_static_regions(self, current_boundaries: List[int], fvi_df: pd.DataFrame) -> List[int]:
+    def tokenize_static_regions(self, current_boundaries: List[int], fvi_df: pd.DataFrame, masked_bounds: Set[int]) -> List[int]:
         """
-        N-Gram Tokenization: Solves zero-variance under-segmentation.
-        
-        Scans for large contiguous blocks of static bytes (where FVI ≈ 0). Since purely 
-        statistical methods fail on constants, this forces structural boundaries based on 
-        standard protocol word alignments (e.g., 16-bit / 2-byte tokenization).
+        Improvement 2 (FIXED): N-Gram Tokenization with Masking.
+        Injects fixed N-Gram boundaries into static headers, while strictly respecting 
+        the `masked_bounds` to prevent destroying dynamic address structures.
         """
         fvi_profile = fvi_df['fvi'].values
         full_bounds = sorted(list(set([0] + current_boundaries + [self.num_bytes])))
@@ -196,20 +192,54 @@ class ProtocolSegmentationEngine:
             end_idx = full_bounds[i+1]
             length = end_idx - start_idx
 
-            # Target blocks larger than the selected N-Gram size
             if length > self.ngram_size:
                 mean_fvi = np.mean(fvi_profile[start_idx:end_idx])
                 
-                # If the block is deeply static (e.g., constant protocol identifiers)
                 if mean_fvi <= self.static_threshold:
-                    # Tokenize the static block by injecting boundaries at N-gram intervals
+                    # Inject boundaries, but ONLY if they haven't been masked by Mutual Information
                     for split_point in range(start_idx + self.ngram_size, end_idx, self.ngram_size):
-                        final_bounds_set.add(split_point)
+                        if split_point not in masked_bounds:
+                            final_bounds_set.add(split_point)
 
         return sorted(list(final_bounds_set))
 
+    def generate_unsupervised_clusters(self, fvi_df: pd.DataFrame) -> List[int]:
+        """
+        Improvement 3: Unsupervised Feature Clustering (DBSCAN).
+        Maps bytes into a 3D feature space [FVI, Mean, StdDev] and clusters them.
+        Transitions in cluster labels represent structurally detected boundaries.
+        """
+        features = []
+        for col in self.df.columns:
+            series = self.df[col].dropna()
+            mean_val = series.mean() if len(series) > 0 else 0
+            std_val = series.std() if len(series) > 0 else 0
+            features.append([mean_val, std_val])
+            
+        fvi_vals = fvi_df['fvi'].values.reshape(-1, 1)
+        
+        # Matrix: [FVI, Byte_Mean, Byte_StdDev]
+        X = np.hstack([fvi_vals, np.array(features)])
+        X = np.nan_to_num(X)
+        
+        # Scale features for DBSCAN
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        # eps=0.6 and min_samples=1 forces robust spatial clustering without rejecting "noise" fields
+        clustering = DBSCAN(eps=0.6, min_samples=1).fit(X_scaled)
+        labels = clustering.labels_
+        
+        # Identify boundaries where feature clusters shift
+        cluster_boundaries = []
+        for i in range(1, len(labels)):
+            if labels[i] != labels[i-1]:
+                cluster_boundaries.append(i)
+                
+        return cluster_boundaries
+
     def reconstruct_schema(self, final_boundaries: List[int], fvi_df: pd.DataFrame) -> pd.DataFrame:
-        """Compiles verified macro-boundaries into a structured protocol schema table."""
+        """Compiles boundaries into a structured dataframe schema."""
         fvi_profile = fvi_df['fvi'].values
         full_bounds = sorted(list(set([0] + final_boundaries + [self.num_bytes])))
         schema_records = []
@@ -237,25 +267,31 @@ class ProtocolSegmentationEngine:
                 "Semantic Typology": typology
             })
 
-        self.schema = pd.DataFrame(schema_records)
-        return self.schema
+        return pd.DataFrame(schema_records)
 
-    def run_pipeline(self) -> Tuple[pd.DataFrame, pd.DataFrame, List[int], List[int], List[int]]:
-        """Executes the complete multi-stage pipeline."""
+    def run_pipeline(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[int], List[int], List[int]]:
+        """
+        Executes all 3 algorithms to output data for 3-Tier Comparison in Streamlit.
+        Returns:
+            Schemas: Baseline, MI & N-Gram (Imp 1+2), Unsupervised Clustering (Imp 3)
+            Boundaries: Baseline, MI & N-Gram, Unsupervised Clustering
+        """
         fvi_df = self.calculate_fvi_and_typology()
         candidates = self.detect_boundaries_bcs(fvi_df)
         kl_verified = self.refine_with_kl_divergence(candidates)
         
-        # 1. Baseline Literature Schema 
+        # --- TIER 1: Baseline Literature Schema ---
         baseline_bounds = self.consolidate_macro_boundaries(kl_verified, fvi_df)
         schema_baseline = self.reconstruct_schema(baseline_bounds, fvi_df)
         
-        # 2. AI Upgrade Schema (Mutual Information + N-Gram Tokenization)
-        mi_verified = self.prune_boundaries_with_mi(kl_verified)
+        # --- TIER 2: Improvements 1 & 2 (MI Masking + N-Gram) ---
+        mi_verified, masked_bounds = self.prune_boundaries_with_mi(kl_verified)
         consolidated_mi_bounds = self.consolidate_macro_boundaries(mi_verified, fvi_df)
+        final_tokenized_bounds = self.tokenize_static_regions(consolidated_mi_bounds, fvi_df, masked_bounds)
+        schema_imp12 = self.reconstruct_schema(final_tokenized_bounds, fvi_df)
         
-        # Apply Improvement 2: Fracture zero-entropy blocks using N-gram alignment
-        final_tokenized_bounds = self.tokenize_static_regions(consolidated_mi_bounds, fvi_df)
-        schema_mi = self.reconstruct_schema(final_tokenized_bounds, fvi_df)
+        # --- TIER 3: Improvement 3 (Unsupervised Feature Clustering) ---
+        cluster_bounds = self.generate_unsupervised_clusters(fvi_df)
+        schema_imp3 = self.reconstruct_schema(cluster_bounds, fvi_df)
         
-        return schema_baseline, schema_mi, candidates, kl_verified, final_tokenized_bounds
+        return schema_baseline, schema_imp12, schema_imp3, baseline_bounds, final_tokenized_bounds, cluster_bounds
